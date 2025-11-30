@@ -95,29 +95,55 @@ class MusicRecommender:
             except (KeyboardInterrupt, EOFError):
                 return None
     
-    def get_recommendations(self, track_id, limit=10):
+    def get_recommendations(self, track_id, limit=10, exclude_track_ids=None):
         """Get recommendations based on a seed track with fallback strategies"""
+        if exclude_track_ids is None:
+            exclude_track_ids = set()
+        
         track_info = self._fetch_track_with_retry(track_id)
         
         if not track_info:
             raise Exception("Failed to fetch track info")
         
-        # Try multiple strategies to get recommendations
+        # Get the original artist to filter duplicates
+        original_artist_ids = [artist['id'] for artist in track_info.get('artists', [])]
+        
+        # First, try to get any recommendations at all
+        all_tracks = []
         strategies = [
-            self._try_track_recommendations,
-            self._try_artist_recommendations,
-            self._try_artist_top_tracks
+            ('related-artists', self._try_related_artists_tracks),  # Try this FIRST for diversity
+            ('track-based', self._try_track_recommendations),
+            ('artist-based', self._try_artist_recommendations)
         ]
         
-        for strategy in strategies:
+        for strategy_name, strategy in strategies:
             try:
-                tracks = strategy(track_info, track_id, limit)
-                if tracks:
-                    return tracks
-            except Exception:
+                tracks = strategy(track_info, track_id, 50)  # Request 50 tracks for better filtering
+                if tracks and len(tracks) >= limit:
+                    all_tracks = tracks
+                    break  # Use first successful strategy with enough tracks
+            except Exception as e:
                 continue
         
-        return []
+        if not all_tracks:
+            return []
+        
+        # Filter out tracks we've already shown
+        all_tracks = [t for t in all_tracks if t['id'] not in exclude_track_ids]
+        
+        if not all_tracks:
+            return []
+        
+        # Filter to get one track per artist, excluding original artist
+        filtered = self._filter_diverse_artists(
+            all_tracks, 
+            original_artist_ids, 
+            limit,
+            max_per_artist=1
+        )
+        
+        # Return whatever we got (should be 10 diverse tracks)
+        return filtered[:limit] if len(filtered) >= limit else filtered
     
     def _fetch_track_with_retry(self, track_id):
         """Fetch track info with exponential backoff retry logic"""
@@ -135,24 +161,131 @@ class MusicRecommender:
     
     def _try_track_recommendations(self, track_info, track_id, limit):
         """Try getting recommendations using track as seed"""
-        return self.sp.recommendations(seed_tracks=[track_id], limit=limit).get('tracks', [])
+        try:
+            return self.sp.recommendations(seed_tracks=[track_id], limit=min(limit, 20)).get('tracks', [])
+        except Exception:
+            # If recommendations endpoint fails, use artist's top tracks instead
+            return []
     
     def _try_artist_recommendations(self, track_info, track_id, limit):
         """Try getting recommendations using artist as seed"""
         artists = track_info.get('artists', [])
         if artists:
             artist_id = artists[0].get('id')
-            return self.sp.recommendations(seed_artists=[artist_id], limit=limit).get('tracks', [])
+            try:
+                return self.sp.recommendations(seed_artists=[artist_id], limit=min(limit, 20)).get('tracks', [])
+            except Exception:
+                # Fallback to artist top tracks if recommendations fail
+                try:
+                    top = self.sp.artist_top_tracks(artist_id, country='US')
+                    return top.get('tracks', [])[:limit]
+                except Exception:
+                    return []
         return []
     
-    def _try_artist_top_tracks(self, track_info, track_id, limit):
-        """Fallback to artist's top tracks"""
+    def _try_related_artists_tracks(self, track_info, track_id, limit):
+        """Get tracks from related artists for more diversity"""
         artists = track_info.get('artists', [])
-        if artists:
-            artist_id = artists[0].get('id')
-            top_tracks = self.sp.artist_top_tracks(artist_id, country='US')
-            return top_tracks.get('tracks', [])[:limit]
-        return []
+        if not artists:
+            return []
+        
+        artist_id = artists[0].get('id')
+        all_tracks = []
+        
+        try:
+            # First try: Get the artist's full info to get genres
+            artist_info = self.sp.artist(artist_id)
+            artist_name = artist_info.get('name', '')
+            genres = artist_info.get('genres', [])
+            
+            # Try the related-artists endpoint first
+            try:
+                related = self.sp.artist_related_artists(artist_id)
+                related_artists = related.get('artists', [])
+            except Exception as e:
+                related_artists = []
+                
+                # Fallback: Search for artists in the same genre(s)
+                if genres:
+                    seen_artist_ids = {artist_id}  # Track to avoid duplicates
+                    
+                    # Try multiple genres to get more variety
+                    for genre in genres[:3]:  # Try up to 3 genres
+                        try:
+                            # Search without quotes for broader results
+                            search_query = f'{genre}'
+                            results = self.sp.search(q=search_query, type='artist', limit=50)
+                            found_artists = results.get('artists', {}).get('items', [])
+                            
+                            # Add unique artists
+                            for a in found_artists:
+                                if a['id'] not in seen_artist_ids:
+                                    related_artists.append(a)
+                                    seen_artist_ids.add(a['id'])
+                            
+                            # Stop if we have enough
+                            if len(related_artists) >= limit * 2:
+                                break
+                        except Exception as e2:
+                            continue
+            
+            # Get top tracks from related artists (get 1 track from many artists)
+            if related_artists:
+                for related_artist in related_artists[:limit]:  # Check up to 'limit' artists
+                    try:
+                        top_tracks = self.sp.artist_top_tracks(related_artist['id'], country='US')
+                        tracks = top_tracks.get('tracks', [])
+                        if tracks:
+                            all_tracks.append(tracks[0])  # Take only the top track from each artist
+                        if len(all_tracks) >= limit:
+                            break
+                    except Exception:
+                        continue
+            
+            return all_tracks
+        except Exception:
+            return []
+    
+    def _filter_diverse_artists(self, tracks, original_artist_ids, limit, max_per_artist=2):
+        """Filter tracks to ensure artist diversity"""
+        filtered = []
+        artist_count = {}
+        original_artist_names = set()
+        
+        # Track original artist names to exclude them
+        for track in tracks:
+            for artist in track.get('artists', []):
+                if artist['id'] in original_artist_ids:
+                    original_artist_names.add(artist['name'])
+        
+        for track in tracks:
+            # Get all artist names for this track
+            track_artist_names = {artist['name'] for artist in track.get('artists', [])}
+            track_artist_ids = [artist['id'] for artist in track.get('artists', [])]
+            
+            # Skip if this is the original artist(s)
+            if any(artist_id in original_artist_ids for artist_id in track_artist_ids):
+                continue
+            
+            # Check if any artist has reached the limit
+            can_add = True
+            for artist in track.get('artists', []):
+                artist_name = artist['name']
+                if artist_count.get(artist_name, 0) >= max_per_artist:
+                    can_add = False
+                    break
+            
+            if can_add:
+                filtered.append(track)
+                # Increment count for all artists on this track
+                for artist in track.get('artists', []):
+                    artist_name = artist['name']
+                    artist_count[artist_name] = artist_count.get(artist_name, 0) + 1
+                
+                if len(filtered) >= limit:
+                    break
+        
+        return filtered
     
     def display_recommendations(self, recommendations):
         """Display recommended tracks in a formatted list"""
@@ -185,13 +318,31 @@ class MusicRecommender:
             
             self._display_selected_track(track)
             
-            print("\nFinding similar tracks...")
-            recommendations = self.get_recommendations(track['id'], limit=10)
+            # Track shown recommendations to avoid duplicates
+            shown_track_ids = set()
             
-            if recommendations:
-                self.display_recommendations(recommendations)
-            else:
-                print("Sorry, couldn't find recommendations for this track.")
+            # Get and display recommendations
+            while True:
+                print("\nFinding similar tracks...")
+                recommendations = self.get_recommendations(
+                    track['id'], 
+                    limit=10,
+                    exclude_track_ids=shown_track_ids
+                )
+                
+                if recommendations:
+                    self.display_recommendations(recommendations)
+                    # Track what we've shown
+                    shown_track_ids.update(rec['id'] for rec in recommendations)
+                else:
+                    print("Sorry, couldn't find recommendations for this track.")
+                    break
+                
+                # Ask if they want 10 more
+                print("\n" + "-" * 60)
+                choice = input("\nWould you like 10 MORE recommendations? (yes/no): ").strip().lower()
+                if choice not in {'yes', 'y', 'yeah', 'yep'}:
+                    break
             
             if not self._should_continue():
                 print("\nThanks for using Music Recommender! 🎵")
