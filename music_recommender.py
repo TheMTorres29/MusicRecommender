@@ -6,7 +6,6 @@ This program asks what you're currently listening to and recommends similar song
 import os
 import warnings
 import logging
-import time
 from dotenv import load_dotenv
 
 try:
@@ -39,8 +38,12 @@ class MusicRecommender:
     
     MAX_RETRIES = 3
     TIMEOUT = 30
+    SEARCH_LIMIT = 5
+    GENRE_ARTIST_LIMIT = 50
+    MAX_GENRES = 3
+    COUNTRY_CODE = 'US'
     
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize Spotify client with credentials"""
         client_id = os.getenv('SPOTIFY_CLIENT_ID')
         client_secret = os.getenv('SPOTIFY_CLIENT_SECRET')
@@ -62,9 +65,9 @@ class MusicRecommender:
             retries=self.MAX_RETRIES
         )
     
-    def search_track(self, query):
+    def search_track(self, query: str):
         """Search for a track on Spotify and let user select from results"""
-        results = self.sp.search(q=query, type='track', limit=5)
+        results = self.sp.search(q=query, type='track', limit=self.SEARCH_LIMIT)
         tracks = results['tracks']['items']
         
         if not tracks:
@@ -79,7 +82,7 @@ class MusicRecommender:
         # Let user choose
         return self._get_user_track_choice(tracks)
     
-    def _get_user_track_choice(self, tracks):
+    def _get_user_track_choice(self, tracks: list):
         """Get user's track selection from search results"""
         while True:
             try:
@@ -95,7 +98,7 @@ class MusicRecommender:
             except (KeyboardInterrupt, EOFError):
                 return None
     
-    def get_recommendations(self, track_id, limit=10, exclude_track_ids=None):
+    def get_recommendations(self, track_id: str, limit: int = 10, exclude_track_ids: set = None) -> list:
         """Get recommendations based on a seed track with fallback strategies"""
         if exclude_track_ids is None:
             exclude_track_ids = set()
@@ -145,17 +148,13 @@ class MusicRecommender:
         # Return whatever we got (should be 10 diverse tracks)
         return filtered[:limit] if len(filtered) >= limit else filtered
     
-    def _fetch_track_with_retry(self, track_id):
-        """Fetch track info with exponential backoff retry logic"""
+    def _fetch_track_with_retry(self, track_id: str):
+        """Fetch track info with retry logic"""
         for attempt in range(self.MAX_RETRIES):
             try:
                 return self.sp.track(track_id)
             except Exception as e:
-                if 'timeout' in str(e).lower() and attempt < self.MAX_RETRIES - 1:
-                    time.sleep(2 ** attempt)  # exponential backoff: 1s, 2s, 4s
-                elif attempt == self.MAX_RETRIES - 1:
-                    raise
-                else:
+                if attempt == self.MAX_RETRIES - 1:
                     raise
         return None
     
@@ -177,76 +176,78 @@ class MusicRecommender:
             except Exception:
                 # Fallback to artist top tracks if recommendations fail
                 try:
-                    top = self.sp.artist_top_tracks(artist_id, country='US')
+                    top = self.sp.artist_top_tracks(artist_id, country=self.COUNTRY_CODE)
                     return top.get('tracks', [])[:limit]
                 except Exception:
                     return []
         return []
     
-    def _try_related_artists_tracks(self, track_info, track_id, limit):
+    def _try_related_artists_tracks(self, track_info: dict, track_id: str, limit: int) -> list:
         """Get tracks from related artists for more diversity"""
         artists = track_info.get('artists', [])
         if not artists:
             return []
         
-        artist_id = artists[0].get('id')
-        all_tracks = []
+        artist_id = artists[0]['id']
         
         try:
-            # First try: Get the artist's full info to get genres
             artist_info = self.sp.artist(artist_id)
-            artist_name = artist_info.get('name', '')
             genres = artist_info.get('genres', [])
             
             # Try the related-artists endpoint first
             try:
                 related = self.sp.artist_related_artists(artist_id)
                 related_artists = related.get('artists', [])
-            except Exception as e:
-                related_artists = []
-                
+            except Exception:
                 # Fallback: Search for artists in the same genre(s)
-                if genres:
-                    seen_artist_ids = {artist_id}  # Track to avoid duplicates
-                    
-                    # Try multiple genres to get more variety
-                    for genre in genres[:3]:  # Try up to 3 genres
-                        try:
-                            # Search without quotes for broader results
-                            search_query = f'{genre}'
-                            results = self.sp.search(q=search_query, type='artist', limit=50)
-                            found_artists = results.get('artists', {}).get('items', [])
-                            
-                            # Add unique artists
-                            for a in found_artists:
-                                if a['id'] not in seen_artist_ids:
-                                    related_artists.append(a)
-                                    seen_artist_ids.add(a['id'])
-                            
-                            # Stop if we have enough
-                            if len(related_artists) >= limit * 2:
-                                break
-                        except Exception as e2:
-                            continue
+                related_artists = self._find_artists_by_genres(genres, artist_id, limit)
             
-            # Get top tracks from related artists (get 1 track from many artists)
-            if related_artists:
-                for related_artist in related_artists[:limit]:  # Check up to 'limit' artists
-                    try:
-                        top_tracks = self.sp.artist_top_tracks(related_artist['id'], country='US')
-                        tracks = top_tracks.get('tracks', [])
-                        if tracks:
-                            all_tracks.append(tracks[0])  # Take only the top track from each artist
-                        if len(all_tracks) >= limit:
-                            break
-                    except Exception:
-                        continue
-            
-            return all_tracks
+            # Get top track from each related artist
+            return self._collect_tracks_from_artists(related_artists, limit)
         except Exception:
             return []
     
-    def _filter_diverse_artists(self, tracks, original_artist_ids, limit, max_per_artist=2):
+    def _find_artists_by_genres(self, genres: list, exclude_artist_id: str, limit: int) -> list:
+        """Search for artists by genre"""
+        if not genres:
+            return []
+        
+        related_artists = []
+        seen_artist_ids = {exclude_artist_id}
+        
+        for genre in genres[:self.MAX_GENRES]:
+            try:
+                results = self.sp.search(q=genre, type='artist', limit=self.GENRE_ARTIST_LIMIT)
+                found_artists = results.get('artists', {}).get('items', [])
+                
+                for artist in found_artists:
+                    if artist['id'] not in seen_artist_ids:
+                        related_artists.append(artist)
+                        seen_artist_ids.add(artist['id'])
+                
+                if len(related_artists) >= limit * 2:
+                    break
+            except Exception:
+                continue
+        
+        return related_artists
+    
+    def _collect_tracks_from_artists(self, artists: list, limit: int) -> list:
+        """Collect one top track from each artist"""
+        tracks = []
+        for artist in artists[:limit]:
+            try:
+                top_tracks = self.sp.artist_top_tracks(artist['id'], country=self.COUNTRY_CODE)
+                artist_tracks = top_tracks.get('tracks', [])
+                if artist_tracks:
+                    tracks.append(artist_tracks[0])
+                if len(tracks) >= limit:
+                    break
+            except Exception:
+                continue
+        return tracks
+    
+    def _filter_diverse_artists(self, tracks: list, original_artist_ids: list, limit: int, max_per_artist: int = 2) -> list:
         """Filter tracks to ensure artist diversity"""
         filtered = []
         artist_count = {}
@@ -287,7 +288,7 @@ class MusicRecommender:
         
         return filtered
     
-    def display_recommendations(self, recommendations):
+    def display_recommendations(self, recommendations: list) -> None:
         """Display recommended tracks in a formatted list"""
         print("\n" + "=" * 60)
         print("🎵 RECOMMENDED TRACKS FOR YOU 🎵")
